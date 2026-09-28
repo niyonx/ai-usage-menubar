@@ -382,6 +382,7 @@ private final class UsageModel: ObservableObject {
                 switch result {
                 case .success(let snapshot):
                     let now = Date()
+                    UserDefaults.standard.removeObject(forKey: "lastClaudeFailure")
                     self.claudeFiveHour = UsageReading(snapshot.fiveHour)
                     self.claudeWeekly = UsageReading(snapshot.sevenDay)
                     self.lastClaudeSuccess = now
@@ -393,6 +394,7 @@ private final class UsageModel: ObservableObject {
                     self.updateDetail = "Codex 1m · Claude 5m"
                 case .failure(let error):
                     let now = Date()
+                    UserDefaults.standard.set(error.localizedDescription, forKey: "lastClaudeFailure")
                     let retryDelay: TimeInterval
                     if case ClaudeUsageError.rateLimited(let retryAfter) = error {
                         retryDelay = max(5 * 60, retryAfter ?? 0)
