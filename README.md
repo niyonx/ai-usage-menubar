@@ -6,7 +6,7 @@ A compact macOS menu bar app showing **remaining** usage in three rows:
 2. Claude weekly
 3. Codex weekly
 
-The first two rows use the Claude logo and color; the third uses the OpenAI logo and color. Each row can include a short usage bar. Click the indicator to see reset times, refresh, toggle the bars, control launch at login, or open Claude and Codex.
+The first two rows use the Claude logo and color; the third uses the OpenAI logo and color. Each row can include a short usage bar. Click the indicator to see reset times, refresh, toggle the bars, control launch at login, or open Claude and Codex. Codex refreshes every minute; Claude refreshes every five minutes. A brief Claude refresh failure keeps the last successful reading (dimmed and marked stale) for up to 15 minutes.
 
 ## Requirements
 

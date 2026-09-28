@@ -4,7 +4,7 @@ import Foundation
 import Security
 import SwiftUI
 
-private struct UsageSnapshot {
+private struct UsageSnapshot: Codable {
     let usedPercent: Int
     let resetsAt: Date?
 }
@@ -191,19 +191,30 @@ private enum ClaudeUsageError: LocalizedError {
     case signedOut
     case unavailable
     case invalidResponse
+    case keychain(OSStatus)
+    case rateLimited(TimeInterval?)
+    case server(Int)
 
     var errorDescription: String? {
         switch self {
         case .notSignedIn, .signedOut: return "Run claude auth login"
         case .unavailable: return "Claude usage is unavailable"
         case .invalidResponse: return "Claude returned an unreadable response"
+        case .keychain(let status): return "Keychain error \(status)"
+        case .rateLimited: return "Claude usage is rate-limited"
+        case .server(let status): return "Claude usage returned HTTP \(status)"
         }
     }
 }
 
-private struct ClaudeUsageSnapshot {
+private struct ClaudeUsageSnapshot: Codable {
     let fiveHour: UsageSnapshot
     let sevenDay: UsageSnapshot
+}
+
+private struct CachedClaudeUsage: Codable {
+    let snapshot: ClaudeUsageSnapshot
+    let fetchedAt: Date
 }
 
 private final class ClaudeUsageReader {
@@ -217,8 +228,11 @@ private final class ClaudeUsageReader {
         ]
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
-        guard status == errSecSuccess,
-              let data = item as? Data,
+        guard status == errSecSuccess else {
+            completion(.failure(status == errSecItemNotFound ? ClaudeUsageError.notSignedIn : ClaudeUsageError.keychain(status)))
+            return
+        }
+        guard let data = item as? Data,
               let credentials = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let oauth = credentials["claudeAiOauth"] as? [String: Any],
               let token = oauth["accessToken"] as? String else {
@@ -252,11 +266,20 @@ private final class ClaudeUsageReader {
                 completion(.failure(ClaudeUsageError.signedOut))
                 return
             }
-            guard response.statusCode == 200, let data,
+            if response.statusCode == 429 {
+                let retryAfter = response.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init)
+                completion(.failure(ClaudeUsageError.rateLimited(retryAfter)))
+                return
+            }
+            guard response.statusCode == 200 else {
+                completion(.failure(ClaudeUsageError.server(response.statusCode)))
+                return
+            }
+            guard let data,
                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let fiveHour = Self.parseWindow(object["five_hour"]),
                   let sevenDay = Self.parseWindow(object["seven_day"]) else {
-                completion(.failure(ClaudeUsageError.unavailable))
+                completion(.failure(ClaudeUsageError.invalidResponse))
                 return
             }
             completion(.success(ClaudeUsageSnapshot(fiveHour: fiveHour, sevenDay: sevenDay)))
@@ -283,7 +306,7 @@ private final class UsageModel: ObservableObject {
     @Published var codexWeekly = UsageReading.loading
     @Published var claudeFiveHour = UsageReading.loading
     @Published var claudeWeekly = UsageReading.loading
-    @Published var updateDetail = "Waiting for first update"
+    @Published var updateDetail = "Codex 1m · Claude 5m"
     @Published var launchAtLoginEnabled = false
     @Published var showBars = UserDefaults.standard.object(forKey: "showBars") as? Bool ?? true {
         didSet { UserDefaults.standard.set(showBars, forKey: "showBars") }
@@ -291,11 +314,22 @@ private final class UsageModel: ObservableObject {
 
     private let codexReader = CodexUsageReader()
     private let claudeReader = ClaudeUsageReader()
+    private let claudeCacheKey = "lastGoodClaudeUsage"
+    private let claudeCacheMaxAge: TimeInterval = 15 * 60
     private var timer: Timer?
     private var isRefreshingCodex = false
     private var isRefreshingClaude = false
+    private var lastClaudeSuccess: Date?
+    private var nextClaudeRefreshAt = Date.distantPast
 
     init() {
+        if let data = UserDefaults.standard.data(forKey: claudeCacheKey),
+           let cache = try? JSONDecoder().decode(CachedClaudeUsage.self, from: data),
+           Date().timeIntervalSince(cache.fetchedAt) < claudeCacheMaxAge {
+            claudeFiveHour = UsageReading(cache.snapshot.fiveHour)
+            claudeWeekly = UsageReading(cache.snapshot.sevenDay)
+            lastClaudeSuccess = cache.fetchedAt
+        }
         launchAtLoginEnabled = FileManager.default.fileExists(atPath: launchAgentURL.path)
         if !launchAtLoginEnabled {
             try? setLaunchAtLogin(true)
@@ -307,13 +341,18 @@ private final class UsageModel: ObservableObject {
         }
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
+            Task { @MainActor in self?.refreshScheduled() }
         }
     }
 
     func refresh() {
         refreshCodex()
-        refreshClaude()
+        refreshClaude(force: true)
+    }
+
+    private func refreshScheduled() {
+        refreshCodex()
+        refreshClaude(force: false)
     }
 
     private func refreshCodex() {
@@ -329,13 +368,12 @@ private final class UsageModel: ObservableObject {
                 case .failure(let error):
                     self.codexWeekly = UsageReading(remaining: nil, resetsAt: nil, error: error.localizedDescription)
                 }
-                self.updateDetail = "Refreshes every minute"
             }
         }
     }
 
-    private func refreshClaude() {
-        guard !isRefreshingClaude else { return }
+    private func refreshClaude(force: Bool) {
+        guard !isRefreshingClaude, (force || Date() >= nextClaudeRefreshAt) else { return }
         isRefreshingClaude = true
         claudeReader.fetch { [weak self] result in
             DispatchQueue.main.async {
@@ -343,14 +381,38 @@ private final class UsageModel: ObservableObject {
                 self.isRefreshingClaude = false
                 switch result {
                 case .success(let snapshot):
+                    let now = Date()
                     self.claudeFiveHour = UsageReading(snapshot.fiveHour)
                     self.claudeWeekly = UsageReading(snapshot.sevenDay)
+                    self.lastClaudeSuccess = now
+                    self.nextClaudeRefreshAt = now.addingTimeInterval(5 * 60)
+                    let cache = CachedClaudeUsage(snapshot: snapshot, fetchedAt: now)
+                    if let data = try? JSONEncoder().encode(cache) {
+                        UserDefaults.standard.set(data, forKey: self.claudeCacheKey)
+                    }
+                    self.updateDetail = "Codex 1m · Claude 5m"
                 case .failure(let error):
-                    let reading = UsageReading(remaining: nil, resetsAt: nil, error: error.localizedDescription)
-                    self.claudeFiveHour = reading
-                    self.claudeWeekly = reading
+                    let now = Date()
+                    let retryDelay: TimeInterval
+                    if case ClaudeUsageError.rateLimited(let retryAfter) = error {
+                        retryDelay = max(5 * 60, retryAfter ?? 0)
+                    } else {
+                        retryDelay = 2 * 60
+                    }
+                    self.nextClaudeRefreshAt = now.addingTimeInterval(retryDelay)
+                    let cacheAge = self.lastClaudeSuccess.map { now.timeIntervalSince($0) }
+                    if let cacheAge, cacheAge < self.claudeCacheMaxAge {
+                        let minutes = max(1, Int(cacheAge / 60))
+                        let message = "Showing last update (\(minutes)m ago) · \(error.localizedDescription)"
+                        self.claudeFiveHour.error = message
+                        self.claudeWeekly.error = message
+                    } else {
+                        let reading = UsageReading(remaining: nil, resetsAt: nil, error: error.localizedDescription)
+                        self.claudeFiveHour = reading
+                        self.claudeWeekly = reading
+                    }
+                    self.updateDetail = "Claude refresh failed · retrying"
                 }
-                self.updateDetail = "Refreshes every minute"
             }
         }
     }
@@ -477,7 +539,8 @@ private struct CodexUsageApp: App {
     }
 
     private func percentage(_ reading: UsageReading) -> String {
-        reading.remaining.map { "\($0) percent" } ?? "unavailable"
+        guard let remaining = reading.remaining else { return "unavailable" }
+        return "\(remaining) percent\(reading.error == nil ? "" : ", last refresh failed")"
     }
 }
 
@@ -503,7 +566,7 @@ private enum StatusArtwork {
         let value = reading.remaining.map { "\($0)%" } ?? "—"
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 8, weight: .semibold),
-            .foregroundColor: NSColor.white
+            .foregroundColor: reading.error == nil ? NSColor.white : NSColor.white.withAlphaComponent(0.6)
         ]
         (value as NSString).draw(at: NSPoint(x: 17, y: bottom), withAttributes: attributes)
 
@@ -513,7 +576,7 @@ private enum StatusArtwork {
         track.fill()
         if let remaining = reading.remaining {
             let filled = NSBezierPath(roundedRect: NSRect(x: 46, y: bottom + 3, width: 18 * CGFloat(remaining) / 100, height: 2), xRadius: 1, yRadius: 1)
-            color.setFill()
+            (reading.error == nil ? color : color.withAlphaComponent(0.5)).setFill()
             filled.fill()
         }
     }
