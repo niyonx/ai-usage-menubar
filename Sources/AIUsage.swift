@@ -218,10 +218,60 @@ private struct CachedClaudeUsage: Codable {
 }
 
 private final class ClaudeUsageReader {
+    private static let service = "Claude Code-credentials"
+    private static let tokenURL = URL(string: "https://platform.claude.com/v1/oauth/token")!
+    private static let clientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+    // Refresh well before expiry so the menu bar, not an idle CLI, keeps the session alive.
+    private static let refreshMargin: TimeInterval = 30 * 60
+
+    private struct Credentials {
+        var root: [String: Any]
+        var oauth: [String: Any]
+        var accessToken: String? { oauth["accessToken"] as? String }
+        var refreshToken: String? { oauth["refreshToken"] as? String }
+        var expiresAt: Date? {
+            (oauth["expiresAt"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue / 1000) }
+        }
+    }
+
     func fetch(completion: @escaping (Result<ClaudeUsageSnapshot, Error>) -> Void) {
+        let credentials: Credentials
+        do { credentials = try Self.loadCredentials() } catch {
+            completion(.failure(error))
+            return
+        }
+
+        let needsRefresh = credentials.expiresAt.map { $0.timeIntervalSinceNow < Self.refreshMargin } ?? false
+        if needsRefresh {
+            refreshThenRequest(credentials, completion: completion)
+            return
+        }
+        guard let token = credentials.accessToken else {
+            completion(.failure(ClaudeUsageError.notSignedIn))
+            return
+        }
+        requestUsage(token: token) { [weak self] result in
+            if case .failure(ClaudeUsageError.signedOut) = result, let self {
+                self.refreshThenRequest(credentials, completion: completion)
+            } else {
+                completion(result)
+            }
+        }
+    }
+
+    private func refreshThenRequest(_ credentials: Credentials, completion: @escaping (Result<ClaudeUsageSnapshot, Error>) -> Void) {
+        refresh(credentials) { [weak self] result in
+            switch result {
+            case .success(let token): self?.requestUsage(token: token, completion: completion)
+            case .failure(let error): completion(.failure(error))
+            }
+        }
+    }
+
+    private static func loadCredentials() throws -> Credentials {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "Claude Code-credentials",
+            kSecAttrService as String: service,
             kSecAttrAccount as String: NSUserName(),
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
@@ -229,23 +279,101 @@ private final class ClaudeUsageReader {
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         guard status == errSecSuccess else {
-            completion(.failure(status == errSecItemNotFound ? ClaudeUsageError.notSignedIn : ClaudeUsageError.keychain(status)))
-            return
+            throw status == errSecItemNotFound ? ClaudeUsageError.notSignedIn : ClaudeUsageError.keychain(status)
         }
         guard let data = item as? Data,
-              let credentials = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let oauth = credentials["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String else {
-            completion(.failure(ClaudeUsageError.notSignedIn))
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let oauth = root["claudeAiOauth"] as? [String: Any] else {
+            throw ClaudeUsageError.notSignedIn
+        }
+        return Credentials(root: root, oauth: oauth)
+    }
+
+    private static func saveCredentials(_ credentials: Credentials) throws {
+        var root = credentials.root
+        root["claudeAiOauth"] = credentials.oauth
+        let data = try JSONSerialization.data(withJSONObject: root)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: NSUserName()
+        ]
+        let status = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        guard status == errSecSuccess else { throw ClaudeUsageError.keychain(status) }
+    }
+
+    /// Exchanges the refresh token and writes the rotated tokens back to the Claude Code
+    /// Keychain item, so the `claude` CLI keeps working with the same session.
+    private func refresh(_ stale: Credentials, completion: @escaping (Result<String, Error>) -> Void) {
+        // The CLI may have refreshed since we read the item; never spend an already-rotated token.
+        var credentials = (try? Self.loadCredentials()) ?? stale
+        if credentials.refreshToken != stale.refreshToken,
+           let token = credentials.accessToken,
+           let expiresAt = credentials.expiresAt, expiresAt.timeIntervalSinceNow > Self.refreshMargin {
+            completion(.success(token))
             return
         }
-
-        if let expiry = oauth["expiresAt"] as? NSNumber,
-           Date(timeIntervalSince1970: expiry.doubleValue / 1000) <= Date() {
+        guard let refreshToken = credentials.refreshToken else {
             completion(.failure(ClaudeUsageError.signedOut))
             return
         }
 
+        var request = URLRequest(url: Self.tokenURL)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 15
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "grant_type": "refresh_token",
+            "refresh_token": refreshToken,
+            "client_id": Self.clientID
+        ])
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error {
+                completion(.failure(error))
+                return
+            }
+            guard let response = response as? HTTPURLResponse else {
+                completion(.failure(ClaudeUsageError.unavailable))
+                return
+            }
+            if response.statusCode == 400 || response.statusCode == 401 || response.statusCode == 403 {
+                completion(.failure(ClaudeUsageError.signedOut))
+                return
+            }
+            if response.statusCode == 429 {
+                let retryAfter = response.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init)
+                completion(.failure(ClaudeUsageError.rateLimited(retryAfter)))
+                return
+            }
+            guard response.statusCode == 200,
+                  let data,
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let accessToken = object["access_token"] as? String else {
+                completion(.failure(ClaudeUsageError.server(response.statusCode)))
+                return
+            }
+            credentials.oauth["accessToken"] = accessToken
+            if let newRefresh = object["refresh_token"] as? String {
+                credentials.oauth["refreshToken"] = newRefresh
+            }
+            if let expiresIn = object["expires_in"] as? NSNumber {
+                let expiresAt = Date().addingTimeInterval(expiresIn.doubleValue)
+                credentials.oauth["expiresAt"] = NSNumber(value: Int64(expiresAt.timeIntervalSince1970 * 1000))
+            }
+            if let scope = object["scope"] as? String {
+                credentials.oauth["scopes"] = scope.split(separator: " ").map(String.init)
+            }
+            do {
+                try Self.saveCredentials(credentials)
+                completion(.success(accessToken))
+            } catch {
+                completion(.failure(error))
+            }
+        }.resume()
+    }
+
+    private func requestUsage(token: String, completion: @escaping (Result<ClaudeUsageSnapshot, Error>) -> Void) {
         var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
         request.timeoutInterval = 12
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
