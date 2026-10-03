@@ -191,7 +191,7 @@ private enum ClaudeUsageError: LocalizedError {
     case signedOut
     case unavailable
     case invalidResponse
-    case keychain(OSStatus)
+    case keychain(Int32)
     case rateLimited(TimeInterval?)
     case server(Int)
 
@@ -210,6 +210,22 @@ private enum ClaudeUsageError: LocalizedError {
 private struct ClaudeUsageSnapshot: Codable {
     let fiveHour: UsageSnapshot
     let sevenDay: UsageSnapshot
+}
+
+private extension Data {
+    init?(hex: String) {
+        guard hex.count.isMultiple(of: 2) else { return nil }
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(hex.count / 2)
+        var index = hex.startIndex
+        while index < hex.endIndex {
+            let next = hex.index(index, offsetBy: 2)
+            guard let byte = UInt8(hex[index..<next], radix: 16) else { return nil }
+            bytes.append(byte)
+            index = next
+        }
+        self.init(bytes)
+    }
 }
 
 private struct CachedClaudeUsage: Codable {
@@ -268,21 +284,22 @@ private final class ClaudeUsageReader {
         }
     }
 
+    // Claude Code writes this item through /usr/bin/security, so that tool is the one app on
+    // the item's access list. Calling the Keychain API directly from this ad-hoc-signed app
+    // prompts for the login password every time Claude Code rotates its token or the app is
+    // rebuilt; going through the same tool keeps reads and writes prompt-free.
+    private static let securityTool = "/usr/bin/security"
+    private static let itemNotFoundExitCode: Int32 = 44
+
     private static func loadCredentials() throws -> Credentials {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: NSUserName(),
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        guard status == errSecSuccess else {
-            throw status == errSecItemNotFound ? ClaudeUsageError.notSignedIn : ClaudeUsageError.keychain(status)
+        let result = try runSecurity(arguments: ["find-generic-password", "-s", service, "-a", NSUserName(), "-w"])
+        guard result.status == 0 else {
+            throw result.status == itemNotFoundExitCode ? ClaudeUsageError.notSignedIn : ClaudeUsageError.keychain(result.status)
         }
-        guard let data = item as? Data,
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let text = String(decoding: result.output, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        // security prints the secret as hex when it contains non-printable bytes.
+        let data = text.hasPrefix("{") ? Data(text.utf8) : (Data(hex: text) ?? Data(text.utf8))
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let oauth = root["claudeAiOauth"] as? [String: Any] else {
             throw ClaudeUsageError.notSignedIn
         }
@@ -293,13 +310,28 @@ private final class ClaudeUsageReader {
         var root = credentials.root
         root["claudeAiOauth"] = credentials.oauth
         let data = try JSONSerialization.data(withJSONObject: root)
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: NSUserName()
-        ]
-        let status = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
-        guard status == errSecSuccess else { throw ClaudeUsageError.keychain(status) }
+        let hex = data.map { String(format: "%02x", $0) }.joined()
+        // Interactive mode reads the command from stdin so the tokens never appear in argv.
+        let command = "add-generic-password -U -a \"\(NSUserName())\" -s \"\(service)\" -X \(hex)\n"
+        let result = try runSecurity(arguments: ["-i"], input: Data(command.utf8))
+        guard result.status == 0 else { throw ClaudeUsageError.keychain(result.status) }
+    }
+
+    private static func runSecurity(arguments: [String], input: Data? = nil) throws -> (status: Int32, output: Data) {
+        let process = Process()
+        let stdout = Pipe()
+        let stdin = Pipe()
+        process.executableURL = URL(fileURLWithPath: securityTool)
+        process.arguments = arguments
+        process.standardOutput = stdout
+        process.standardError = FileHandle.nullDevice
+        process.standardInput = stdin
+        try process.run()
+        if let input { stdin.fileHandleForWriting.write(input) }
+        try? stdin.fileHandleForWriting.close()
+        let output = stdout.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, output)
     }
 
     /// Exchanges the refresh token and writes the rotated tokens back to the Claude Code
