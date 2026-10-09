@@ -329,6 +329,10 @@ private final class ClaudeUsageReader {
     private static let securityTool = "/usr/bin/security"
     private static let itemNotFoundExitCode: Int32 = 44
 
+    static var hasAppSession: Bool {
+        (try? loadCredentials(service: appService)) != nil
+    }
+
     private static func loadCredentials(service: String) throws -> Credentials {
         let result = try runSecurity(arguments: ["find-generic-password", "-s", service, "-a", NSUserName(), "-w"])
         guard result.status == 0 else {
@@ -793,6 +797,7 @@ private final class UsageModel: ObservableObject {
         guard !isRefreshingClaude, (force || Date() >= nextClaudeRefreshAt) else { return }
         isRefreshingClaude = true
         claudeReader.fetch { [weak self] result in
+            let hasAppSession = ClaudeUsageReader.hasAppSession
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isRefreshingClaude = false
@@ -802,7 +807,8 @@ private final class UsageModel: ObservableObject {
                     UserDefaults.standard.removeObject(forKey: "lastClaudeFailure")
                     self.claudeFiveHour = UsageReading(snapshot.fiveHour)
                     self.claudeWeekly = UsageReading(snapshot.sevenDay)
-                    self.claudeNeedsSignIn = false
+                    // Borrowing the CLI's token only lasts until it expires, so keep offering sign-in.
+                    self.claudeNeedsSignIn = !hasAppSession
                     self.lastClaudeSuccess = now
                     self.nextClaudeRefreshAt = now.addingTimeInterval(5 * 60)
                     let cache = CachedClaudeUsage(snapshot: snapshot, fetchedAt: now)
@@ -815,7 +821,7 @@ private final class UsageModel: ObservableObject {
                     UserDefaults.standard.set(error.localizedDescription, forKey: "lastClaudeFailure")
                     switch error {
                     case ClaudeUsageError.notSignedIn, ClaudeUsageError.signedOut: self.claudeNeedsSignIn = true
-                    default: break
+                    default: self.claudeNeedsSignIn = !hasAppSession
                     }
                     let retryDelay: TimeInterval
                     if case ClaudeUsageError.rateLimited(let retryAfter) = error {
