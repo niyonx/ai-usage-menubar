@@ -24,7 +24,7 @@ if [[ -f "$chatgpt_app_path/Contents/Resources/icon-chatgpt.icns" ]]; then
 fi
 
 swiftc -parse-as-library -O "$repo_dir/Sources/AIUsage.swift" \
-  -framework AppKit -framework SwiftUI -framework Security \
+  -framework AppKit -framework SwiftUI -framework Security -framework Network -framework CryptoKit \
   -o "$app_path/Contents/MacOS/CodexUsage"
 codesign --force --deep --sign - "$app_path"
 printf 'Built %s\n' "$app_path"

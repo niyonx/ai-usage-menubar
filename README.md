@@ -6,7 +6,7 @@ A compact macOS menu bar app showing **remaining** usage in three rows:
 2. Claude weekly
 3. Codex weekly
 
-The first two rows use the Claude logo and color; the third uses the OpenAI logo and color. Each row can include a short usage bar. Click the indicator to see reset times, refresh, toggle the bars, control launch at login, or open Claude and Codex. Codex refreshes every minute; Claude refreshes every five minutes. A brief Claude refresh failure keeps the last successful reading (dimmed and marked stale) for up to 15 minutes.
+The first two rows use the Claude logo and color; the third uses the OpenAI logo and color. Each row can include a short usage bar. Click the indicator to see reset times, refresh, toggle the bars, control launch at login, or open Claude and Codex. Codex refreshes every minute; Claude refreshes every five minutes. A brief Claude refresh failure keeps the last successful reading (dimmed and marked stale) for up to an hour.
 
 ## Requirements
 
@@ -27,7 +27,7 @@ The app is built at `dist/AI Usage.app` and signed locally with an ad hoc signat
 ## How it reads usage
 
 - Codex: starts the locally installed `codex app-server` and requests account rate limits.
-- Claude: reads the current Claude Code OAuth credential from the macOS Keychain and requests `https://api.anthropic.com/api/oauth/usage`. The token is used in memory and is not logged or written by this app. If Claude Code is signed out, the Claude rows show an unavailable state.
+- Claude: requests `https://api.anthropic.com/api/oauth/usage` with the app's own Claude sign-in ("Sign in to Claude" in the popup), stored in its own Keychain item and refreshed by the app. Until you sign in, it borrows a signed-in Claude Code CLI's access token read-only; it never refreshes or rewrites the CLI's credential, because refresh tokens rotate and sharing one logs the CLI out.
 
 The Claude usage endpoint is not a documented public API and could change. This is an unofficial project and is not affiliated with Anthropic or OpenAI.
 

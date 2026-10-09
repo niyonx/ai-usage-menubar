@@ -1,6 +1,8 @@
 import AppKit
+import CryptoKit
 import Darwin
 import Foundation
+import Network
 import Security
 import SwiftUI
 
@@ -197,7 +199,7 @@ private enum ClaudeUsageError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .notSignedIn, .signedOut: return "Run claude auth login"
+        case .notSignedIn, .signedOut: return "Sign in to Claude from this menu"
         case .unavailable: return "Claude usage is unavailable"
         case .invalidResponse: return "Claude returned an unreadable response"
         case .keychain(let status): return "Keychain error \(status)"
@@ -234,13 +236,16 @@ private struct CachedClaudeUsage: Codable {
 }
 
 private final class ClaudeUsageReader {
-    private static let service = "Claude Code-credentials"
-    private static let tokenURL = URL(string: "https://platform.claude.com/v1/oauth/token")!
-    private static let clientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-    // Refresh well before expiry so the menu bar, not an idle CLI, keeps the session alive.
-    private static let refreshMargin: TimeInterval = 30 * 60
+    // The app keeps its own OAuth session in its own Keychain item. Refresh tokens rotate on
+    // every use, so sharing Claude Code's session meant the app and the CLI kept invalidating
+    // each other's token, and both ended up signed out.
+    fileprivate static let appService = "AI Usage-Claude OAuth"
+    private static let cliService = "Claude Code-credentials"
+    fileprivate static let tokenURL = URL(string: "https://platform.claude.com/v1/oauth/token")!
+    fileprivate static let clientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+    private static let refreshMargin: TimeInterval = 5 * 60
 
-    private struct Credentials {
+    fileprivate struct Credentials {
         var root: [String: Any]
         var oauth: [String: Any]
         var accessToken: String? { oauth["accessToken"] as? String }
@@ -248,22 +253,45 @@ private final class ClaudeUsageReader {
         var expiresAt: Date? {
             (oauth["expiresAt"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue / 1000) }
         }
+
+        mutating func apply(tokenResponse object: [String: Any]) -> Bool {
+            guard let accessToken = object["access_token"] as? String else { return false }
+            oauth["accessToken"] = accessToken
+            if let newRefresh = object["refresh_token"] as? String {
+                oauth["refreshToken"] = newRefresh
+            }
+            if let expiresIn = object["expires_in"] as? NSNumber {
+                let expiresAt = Date().addingTimeInterval(expiresIn.doubleValue)
+                oauth["expiresAt"] = NSNumber(value: Int64(expiresAt.timeIntervalSince1970 * 1000))
+            }
+            if let scope = object["scope"] as? String {
+                oauth["scopes"] = scope.split(separator: " ").map(String.init)
+            }
+            return true
+        }
     }
 
     func fetch(completion: @escaping (Result<ClaudeUsageSnapshot, Error>) -> Void) {
-        let credentials: Credentials
-        do { credentials = try Self.loadCredentials() } catch {
-            completion(.failure(error))
+        if let credentials = try? Self.loadCredentials(service: Self.appService) {
+            fetchWithAppSession(credentials, completion: completion)
             return
         }
 
-        let needsRefresh = credentials.expiresAt.map { $0.timeIntervalSinceNow < Self.refreshMargin } ?? false
-        if needsRefresh {
-            refreshThenRequest(credentials, completion: completion)
+        // Until the app has its own session, borrow a signed-in Claude Code CLI's access token
+        // read-only. Never refresh or rewrite that item: spending its refresh token logs the CLI out.
+        guard let cli = try? Self.loadCredentials(service: Self.cliService),
+              let token = cli.accessToken,
+              cli.expiresAt.map({ $0 > Date() }) ?? true else {
+            completion(.failure(ClaudeUsageError.notSignedIn))
             return
         }
-        guard let token = credentials.accessToken else {
-            completion(.failure(ClaudeUsageError.notSignedIn))
+        requestUsage(token: token, completion: completion)
+    }
+
+    private func fetchWithAppSession(_ credentials: Credentials, completion: @escaping (Result<ClaudeUsageSnapshot, Error>) -> Void) {
+        let needsRefresh = credentials.expiresAt.map { $0.timeIntervalSinceNow < Self.refreshMargin } ?? false
+        guard !needsRefresh, let token = credentials.accessToken else {
+            refreshThenRequest(credentials, completion: completion)
             return
         }
         requestUsage(token: token) { [weak self] result in
@@ -284,14 +312,12 @@ private final class ClaudeUsageReader {
         }
     }
 
-    // Claude Code writes this item through /usr/bin/security, so that tool is the one app on
-    // the item's access list. Calling the Keychain API directly from this ad-hoc-signed app
-    // prompts for the login password every time Claude Code rotates its token or the app is
-    // rebuilt; going through the same tool keeps reads and writes prompt-free.
+    // Items written through /usr/bin/security list that tool as their trusted app, so reading
+    // them through it again never prompts, even though this app is only ad-hoc signed.
     private static let securityTool = "/usr/bin/security"
     private static let itemNotFoundExitCode: Int32 = 44
 
-    private static func loadCredentials() throws -> Credentials {
+    private static func loadCredentials(service: String) throws -> Credentials {
         let result = try runSecurity(arguments: ["find-generic-password", "-s", service, "-a", NSUserName(), "-w"])
         guard result.status == 0 else {
             throw result.status == itemNotFoundExitCode ? ClaudeUsageError.notSignedIn : ClaudeUsageError.keychain(result.status)
@@ -306,13 +332,13 @@ private final class ClaudeUsageReader {
         return Credentials(root: root, oauth: oauth)
     }
 
-    private static func saveCredentials(_ credentials: Credentials) throws {
+    fileprivate static func saveAppCredentials(_ credentials: Credentials) throws {
         var root = credentials.root
         root["claudeAiOauth"] = credentials.oauth
         let data = try JSONSerialization.data(withJSONObject: root)
         let hex = data.map { String(format: "%02x", $0) }.joined()
         // Interactive mode reads the command from stdin so the tokens never appear in argv.
-        let command = "add-generic-password -U -a \"\(NSUserName())\" -s \"\(service)\" -X \(hex)\n"
+        let command = "add-generic-password -U -a \"\(NSUserName())\" -s \"\(appService)\" -X \(hex)\n"
         let result = try runSecurity(arguments: ["-i"], input: Data(command.utf8))
         guard result.status == 0 else { throw ClaudeUsageError.keychain(result.status) }
     }
@@ -334,31 +360,42 @@ private final class ClaudeUsageReader {
         return (process.terminationStatus, output)
     }
 
-    /// Exchanges the refresh token and writes the rotated tokens back to the Claude Code
-    /// Keychain item, so the `claude` CLI keeps working with the same session.
-    private func refresh(_ stale: Credentials, completion: @escaping (Result<String, Error>) -> Void) {
-        // The CLI may have refreshed since we read the item; never spend an already-rotated token.
-        var credentials = (try? Self.loadCredentials()) ?? stale
-        if credentials.refreshToken != stale.refreshToken,
-           let token = credentials.accessToken,
-           let expiresAt = credentials.expiresAt, expiresAt.timeIntervalSinceNow > Self.refreshMargin {
-            completion(.success(token))
-            return
-        }
+    /// Exchanges the app's own refresh token and stores the rotated tokens in the app's item.
+    private func refresh(_ credentials: Credentials, completion: @escaping (Result<String, Error>) -> Void) {
         guard let refreshToken = credentials.refreshToken else {
             completion(.failure(ClaudeUsageError.signedOut))
             return
         }
-
-        var request = URLRequest(url: Self.tokenURL)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 15
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+        Self.postToken([
             "grant_type": "refresh_token",
             "refresh_token": refreshToken,
             "client_id": Self.clientID
-        ])
+        ]) { result in
+            switch result {
+            case .failure(let error):
+                completion(.failure(error))
+            case .success(let object):
+                var updated = credentials
+                guard updated.apply(tokenResponse: object), let token = updated.accessToken else {
+                    completion(.failure(ClaudeUsageError.invalidResponse))
+                    return
+                }
+                do {
+                    try Self.saveAppCredentials(updated)
+                    completion(.success(token))
+                } catch {
+                    completion(.failure(error))
+                }
+            }
+        }
+    }
+
+    fileprivate static func postToken(_ body: [String: String], completion: @escaping (Result<[String: Any], Error>) -> Void) {
+        var request = URLRequest(url: tokenURL)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 15
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
         URLSession.shared.dataTask(with: request) { data, response, error in
             if let error {
@@ -380,28 +417,11 @@ private final class ClaudeUsageReader {
             }
             guard response.statusCode == 200,
                   let data,
-                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let accessToken = object["access_token"] as? String else {
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 completion(.failure(ClaudeUsageError.server(response.statusCode)))
                 return
             }
-            credentials.oauth["accessToken"] = accessToken
-            if let newRefresh = object["refresh_token"] as? String {
-                credentials.oauth["refreshToken"] = newRefresh
-            }
-            if let expiresIn = object["expires_in"] as? NSNumber {
-                let expiresAt = Date().addingTimeInterval(expiresIn.doubleValue)
-                credentials.oauth["expiresAt"] = NSNumber(value: Int64(expiresAt.timeIntervalSince1970 * 1000))
-            }
-            if let scope = object["scope"] as? String {
-                credentials.oauth["scopes"] = scope.split(separator: " ").map(String.init)
-            }
-            do {
-                try Self.saveCredentials(credentials)
-                completion(.success(accessToken))
-            } catch {
-                completion(.failure(error))
-            }
+            completion(.success(object))
         }.resume()
     }
 
@@ -461,6 +481,152 @@ private final class ClaudeUsageReader {
     }
 }
 
+/// Signs the app in to Claude with the same OAuth flow Claude Code uses (PKCE + localhost
+/// callback), giving the app a session of its own.
+private final class ClaudeSignIn {
+    private static let authorizeURL = "https://claude.com/cai/oauth/authorize"
+    private static let successURL = "https://platform.claude.com/oauth/code/success?app=claude-code"
+    private static let scopes = "user:profile user:inference"
+
+    private let queue = DispatchQueue(label: "com.stevie.codexusage.signin")
+    private var listener: NWListener?
+    private var completion: ((Result<Void, Error>) -> Void)?
+
+    func start(completion: @escaping (Result<Void, Error>) -> Void) {
+        queue.async {
+            self.finish(.failure(CancellationError()))
+            self.completion = completion
+            do { try self.listen() } catch { self.finish(.failure(error)) }
+        }
+    }
+
+    private func listen() throws {
+        let verifier = Self.randomToken()
+        let state = Self.randomToken()
+        let challenge = Self.base64URL(Data(SHA256.hash(data: Data(verifier.utf8))))
+
+        let parameters = NWParameters.tcp
+        parameters.requiredInterfaceType = .loopback
+        let listener = try NWListener(using: parameters)
+        self.listener = listener
+
+        listener.stateUpdateHandler = { [weak self] state_ in
+            guard let self else { return }
+            switch state_ {
+            case .ready:
+                guard let port = listener.port?.rawValue else { return }
+                var components = URLComponents(string: Self.authorizeURL)!
+                components.queryItems = [
+                    URLQueryItem(name: "code", value: "true"),
+                    URLQueryItem(name: "client_id", value: ClaudeUsageReader.clientID),
+                    URLQueryItem(name: "response_type", value: "code"),
+                    URLQueryItem(name: "redirect_uri", value: "http://localhost:\(port)/callback"),
+                    URLQueryItem(name: "scope", value: Self.scopes),
+                    URLQueryItem(name: "code_challenge", value: challenge),
+                    URLQueryItem(name: "code_challenge_method", value: "S256"),
+                    URLQueryItem(name: "state", value: state)
+                ]
+                if let url = components.url {
+                    DispatchQueue.main.async { NSWorkspace.shared.open(url) }
+                }
+            case .failed(let error):
+                self.finish(.failure(error))
+            default:
+                break
+            }
+        }
+        listener.newConnectionHandler = { [weak self] connection in
+            self?.handle(connection, verifier: verifier, state: state)
+        }
+        listener.start(queue: queue)
+
+        // Give up if the browser flow is abandoned.
+        queue.asyncAfter(deadline: .now() + 10 * 60) { [weak self, weak listener] in
+            guard let self, let listener, self.listener === listener else { return }
+            self.finish(.failure(URLError(.timedOut)))
+        }
+    }
+
+    private func handle(_ connection: NWConnection, verifier: String, state: String) {
+        connection.start(queue: queue)
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 16 * 1024) { [weak self] data, _, _, _ in
+            guard let self else { return }
+            let requestLine = data.flatMap { String(data: $0, encoding: .utf8) }?
+                .components(separatedBy: "\r\n").first ?? ""
+            let target = requestLine.split(separator: " ").dropFirst().first.map(String.init) ?? ""
+            guard let components = URLComponents(string: "http://localhost" + target),
+                  components.path == "/callback",
+                  let port = self.listener?.port?.rawValue else {
+                Self.respond(connection, status: "404 Not Found", location: nil)
+                return
+            }
+            let items = components.queryItems ?? []
+            guard items.first(where: { $0.name == "state" })?.value == state,
+                  let code = items.first(where: { $0.name == "code" })?.value else {
+                Self.respond(connection, status: "400 Bad Request", location: nil)
+                self.finish(.failure(ClaudeUsageError.signedOut))
+                return
+            }
+            Self.respond(connection, status: "302 Found", location: Self.successURL)
+            ClaudeUsageReader.postToken([
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": "http://localhost:\(port)/callback",
+                "client_id": ClaudeUsageReader.clientID,
+                "code_verifier": verifier,
+                "state": state
+            ]) { [weak self] result in
+                self?.queue.async {
+                    switch result {
+                    case .failure(let error):
+                        self?.finish(.failure(error))
+                    case .success(let object):
+                        var credentials = ClaudeUsageReader.Credentials(root: [:], oauth: [:])
+                        guard credentials.apply(tokenResponse: object), credentials.refreshToken != nil else {
+                            self?.finish(.failure(ClaudeUsageError.invalidResponse))
+                            return
+                        }
+                        do {
+                            try ClaudeUsageReader.saveAppCredentials(credentials)
+                            self?.finish(.success(()))
+                        } catch {
+                            self?.finish(.failure(error))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func finish(_ result: Result<Void, Error>) {
+        listener?.cancel()
+        listener = nil
+        let completion = self.completion
+        self.completion = nil
+        completion?(result)
+    }
+
+    private static func respond(_ connection: NWConnection, status: String, location: String?) {
+        var head = "HTTP/1.1 \(status)\r\nConnection: close\r\nContent-Length: 0\r\n"
+        if let location { head += "Location: \(location)\r\n" }
+        head += "\r\n"
+        connection.send(content: Data(head.utf8), completion: .contentProcessed { _ in connection.cancel() })
+    }
+
+    private static func randomToken() -> String {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        return base64URL(Data(bytes))
+    }
+
+    private static func base64URL(_ data: Data) -> String {
+        data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+}
+
 @MainActor
 private final class UsageModel: ObservableObject {
     @Published var codexWeekly = UsageReading.loading
@@ -468,14 +634,17 @@ private final class UsageModel: ObservableObject {
     @Published var claudeWeekly = UsageReading.loading
     @Published var updateDetail = "Codex 1m · Claude 5m"
     @Published var launchAtLoginEnabled = false
+    @Published var claudeNeedsSignIn = false
+    @Published var isSigningIn = false
     @Published var showBars = UserDefaults.standard.object(forKey: "showBars") as? Bool ?? true {
         didSet { UserDefaults.standard.set(showBars, forKey: "showBars") }
     }
 
     private let codexReader = CodexUsageReader()
     private let claudeReader = ClaudeUsageReader()
+    private let claudeSignIn = ClaudeSignIn()
     private let claudeCacheKey = "lastGoodClaudeUsage"
-    private let claudeCacheMaxAge: TimeInterval = 15 * 60
+    private let claudeCacheMaxAge: TimeInterval = 60 * 60
     private var timer: Timer?
     private var isRefreshingCodex = false
     private var isRefreshingClaude = false
@@ -545,6 +714,7 @@ private final class UsageModel: ObservableObject {
                     UserDefaults.standard.removeObject(forKey: "lastClaudeFailure")
                     self.claudeFiveHour = UsageReading(snapshot.fiveHour)
                     self.claudeWeekly = UsageReading(snapshot.sevenDay)
+                    self.claudeNeedsSignIn = false
                     self.lastClaudeSuccess = now
                     self.nextClaudeRefreshAt = now.addingTimeInterval(5 * 60)
                     let cache = CachedClaudeUsage(snapshot: snapshot, fetchedAt: now)
@@ -555,6 +725,10 @@ private final class UsageModel: ObservableObject {
                 case .failure(let error):
                     let now = Date()
                     UserDefaults.standard.set(error.localizedDescription, forKey: "lastClaudeFailure")
+                    switch error {
+                    case ClaudeUsageError.notSignedIn, ClaudeUsageError.signedOut: self.claudeNeedsSignIn = true
+                    default: break
+                    }
                     let retryDelay: TimeInterval
                     if case ClaudeUsageError.rateLimited(let retryAfter) = error {
                         retryDelay = max(5 * 60, retryAfter ?? 0)
@@ -574,6 +748,25 @@ private final class UsageModel: ObservableObject {
                         self.claudeWeekly = reading
                     }
                     self.updateDetail = "Claude refresh failed · retrying"
+                }
+            }
+        }
+    }
+
+    func signInToClaude() {
+        guard !isSigningIn else { return }
+        isSigningIn = true
+        updateDetail = "Finish signing in in your browser"
+        claudeSignIn.start { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isSigningIn = false
+                switch result {
+                case .success:
+                    self.updateDetail = "Signed in to Claude"
+                    self.refreshClaude(force: true)
+                case .failure(let error):
+                    self.updateDetail = "Claude sign-in failed: \(error.localizedDescription)"
                 }
             }
         }
@@ -644,6 +837,14 @@ private struct CodexUsageApp: App {
                     .padding(.top, 12)
                 UsageRow(title: "Codex · weekly", reading: model.codexWeekly, color: codexColor)
                     .padding(.top, 12)
+
+                if model.claudeNeedsSignIn {
+                    Button(model.isSigningIn ? "Waiting for browser…" : "Sign in to Claude") {
+                        model.signInToClaude()
+                    }
+                    .disabled(model.isSigningIn)
+                    .padding(.top, 12)
+                }
 
                 Divider().padding(.vertical, 12)
 
