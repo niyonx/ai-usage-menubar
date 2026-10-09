@@ -652,6 +652,12 @@ private final class UsageModel: ObservableObject {
     private var nextClaudeRefreshAt = Date.distantPast
 
     init() {
+        // A second copy would refresh the same single-use token and sign both out.
+        if let bundleID = Bundle.main.bundleIdentifier,
+           NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+               .contains(where: { $0.processIdentifier != getpid() }) {
+            exit(0)
+        }
         if let data = UserDefaults.standard.data(forKey: claudeCacheKey),
            let cache = try? JSONDecoder().decode(CachedClaudeUsage.self, from: data),
            Date().timeIntervalSince(cache.fetchedAt) < claudeCacheMaxAge {
