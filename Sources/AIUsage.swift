@@ -272,13 +272,25 @@ private final class ClaudeUsageReader {
     }
 
     func fetch(completion: @escaping (Result<ClaudeUsageSnapshot, Error>) -> Void) {
-        if let credentials = try? Self.loadCredentials(service: Self.appService) {
-            fetchWithAppSession(credentials, completion: completion)
+        guard let credentials = try? Self.loadCredentials(service: Self.appService) else {
+            fetchWithCLIToken(completion: completion)
             return
         }
+        fetchWithAppSession(credentials) { [weak self] result in
+            // If Claude ended the app's session, keep working off the CLI until the user signs in again.
+            if case .failure(ClaudeUsageError.signedOut) = result, let self {
+                self.fetchWithCLIToken { fallback in
+                    if case .success = fallback { completion(fallback) } else { completion(result) }
+                }
+            } else {
+                completion(result)
+            }
+        }
+    }
 
-        // Until the app has its own session, borrow a signed-in Claude Code CLI's access token
-        // read-only. Never refresh or rewrite that item: spending its refresh token logs the CLI out.
+    // Borrow a signed-in Claude Code CLI's access token read-only. Never refresh or rewrite that
+    // item: spending its refresh token logs the CLI out.
+    private func fetchWithCLIToken(completion: @escaping (Result<ClaudeUsageSnapshot, Error>) -> Void) {
         guard let cli = try? Self.loadCredentials(service: Self.cliService),
               let token = cli.accessToken,
               cli.expiresAt.map({ $0 > Date() }) ?? true else {
@@ -406,7 +418,11 @@ private final class ClaudeUsageReader {
                 completion(.failure(ClaudeUsageError.unavailable))
                 return
             }
-            if response.statusCode == 400 || response.statusCode == 401 || response.statusCode == 403 {
+            let object = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            // Only a rejected grant means the session is gone. Any other failure is treated as
+            // transient so the stored tokens are kept and the refresh is retried later.
+            let errorCode = (object?["error"] as? String) ?? ((object?["error"] as? [String: Any])?["type"] as? String)
+            if errorCode == "invalid_grant" || response.statusCode == 401 {
                 completion(.failure(ClaudeUsageError.signedOut))
                 return
             }
@@ -415,9 +431,7 @@ private final class ClaudeUsageReader {
                 completion(.failure(ClaudeUsageError.rateLimited(retryAfter)))
                 return
             }
-            guard response.statusCode == 200,
-                  let data,
-                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            guard response.statusCode == 200, let object else {
                 completion(.failure(ClaudeUsageError.server(response.statusCode)))
                 return
             }
@@ -426,6 +440,74 @@ private final class ClaudeUsageReader {
     }
 
     private func requestUsage(token: String, completion: @escaping (Result<ClaudeUsageSnapshot, Error>) -> Void) {
+        requestUsageEndpoint(token: token) { [weak self] result in
+            guard case .failure(let error) = result, let self else {
+                completion(result)
+                return
+            }
+            switch error {
+            case ClaudeUsageError.signedOut, ClaudeUsageError.notSignedIn:
+                completion(result)
+            default:
+                // The usage endpoint is undocumented and often rate-limited; the API reports the
+                // same windows in its rate-limit headers, so read them from a one-token request.
+                self.requestUsageFromHeaders(token: token) { fallback in
+                    if case .success = fallback { completion(fallback) } else { completion(result) }
+                }
+            }
+        }
+    }
+
+    private func requestUsageFromHeaders(token: String, completion: @escaping (Result<ClaudeUsageSnapshot, Error>) -> Void) {
+        var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 20
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 1,
+            "system": "You are Claude Code, Anthropic's official CLI for Claude.",
+            "messages": [["role": "user", "content": "."]]
+        ] as [String: Any])
+
+        URLSession.shared.dataTask(with: request) { _, response, error in
+            if let error {
+                completion(.failure(error))
+                return
+            }
+            guard let response = response as? HTTPURLResponse else {
+                completion(.failure(ClaudeUsageError.unavailable))
+                return
+            }
+            if response.statusCode == 401 || response.statusCode == 403 {
+                completion(.failure(ClaudeUsageError.signedOut))
+                return
+            }
+            // A 429 from an exhausted window still carries the headers.
+            guard let fiveHour = Self.parseHeaderWindow(response, "5h"),
+                  let sevenDay = Self.parseHeaderWindow(response, "7d") else {
+                completion(.failure(ClaudeUsageError.server(response.statusCode)))
+                return
+            }
+            completion(.success(ClaudeUsageSnapshot(fiveHour: fiveHour, sevenDay: sevenDay)))
+        }.resume()
+    }
+
+    private static func parseHeaderWindow(_ response: HTTPURLResponse, _ window: String) -> UsageSnapshot? {
+        let prefix = "anthropic-ratelimit-unified-\(window)-"
+        guard let utilization = response.value(forHTTPHeaderField: prefix + "utilization").flatMap(Double.init) else { return nil }
+        // Headers report a 0–1 fraction; the usage endpoint reports a percentage.
+        let percent = utilization <= 1 ? utilization * 100 : utilization
+        let reset = response.value(forHTTPHeaderField: prefix + "reset")
+            .flatMap(TimeInterval.init)
+            .map(Date.init(timeIntervalSince1970:))
+        return UsageSnapshot(usedPercent: max(0, min(100, Int(percent.rounded()))), resetsAt: reset)
+    }
+
+    private func requestUsageEndpoint(token: String, completion: @escaping (Result<ClaudeUsageSnapshot, Error>) -> Void) {
         var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
         request.timeoutInterval = 12
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
